@@ -1,0 +1,14 @@
+# Ignore everything by default
+*
+
+# But keep these files
+!agent.py
+!requirements.txt
+
+# Also keep this file
+!.gitignore
+
+# Ignore specific directories we don't want
+/runs/
+/venv/
+*.log 

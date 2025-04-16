@@ -28,7 +28,7 @@ logging.basicConfig(
 # Constants for agent behavior
 MODEL_NAME = "claude-3-7-sonnet-20250219"
 MAX_RETRIES = 1
-EXECUTION_TIMEOUT = 10
+EXECUTION_TIMEOUT = 20
 API_MAX_TOKENS = 2048
 API_TEMPERATURE = 0.2
 

@@ -7,7 +7,7 @@ This project contains a Python-based AI agent (`agent.py`) designed to automate 
 *   **Code Generation**: Generates Python code based on a user-provided experiment description.
 *   **Dependency Management**: Analyzes generated code to identify necessary pip packages and installs them automatically.
 *   **Code Execution**: Executes the generated Python code in an isolated environment, capturing stdout, stderr, and return codes.
-*   **Iterative Refinement**: If code execution fails or produces errors, the agent attempts to refine the code based on the error context (up to `MAX_ITER` times).
+*   **Iterative Refinement**: The agent attempts to refine the code based on past run summaries and any error context (up to `MAX_ITER` times).
 *   **Result Summarization**: After successful execution, the agent analyzes the original prompt, the executed code, textual results (`results.txt`), and any generated images (`*.png`) to produce a Markdown summary of the experiment.
 *   **Organized Output**: Each experiment run is stored in a timestamped subdirectory within the `runs` directory, containing the generated code (`main.py`), requirements (`requirements.txt`), results (`results.txt`), images (`*.png`), and a summary (`summary.md`).
 *   **Logging**: Detailed logs of the agent's operations are recorded in `agent.log`.

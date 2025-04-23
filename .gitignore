@@ -4,6 +4,7 @@
 # But keep these files
 !agent.py
 !requirements.txt
+!README.md
 
 # Also keep this file
 !.gitignore

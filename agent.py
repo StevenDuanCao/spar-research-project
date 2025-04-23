@@ -5,32 +5,25 @@ import re
 import logging
 import tempfile
 import sys
-from datetime import datetime
-import time
-import select
-import glob
 import base64
+import glob
+from datetime import datetime
+from typing import Tuple, Optional, List, Dict, Any
 
 ##### CONFIGURATION #####
 
-# Agent configurations
-MAX_ITER = 1
-EXEC_TIMEOUT = 20
+# Agent constants
+MAX_ITER = 2
+EXEC_TIMEOUT = 20  # execution limit in seconds
+AGENT_RUN_DIR = "runs"  # Parent directory for experiment runs
+LOG_FILENAME = "agent.log"  # Log file for agent actions
+
+# Anthropic API constants
+MODEL_NAME = "claude-3-5-sonnet-20240620"
 MAX_TOKENS = 2048
 TEMPERATURE = 0.2
-AGENT_RUN_DIR = "runs"                      # Parent directory for experiment runs
-LOG_FILENAME = "agent.log"                  # Log file for agent actions
-MODEL_NAME = "claude-3-5-sonnet-20240620"
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    filename=LOG_FILENAME,
-    filemode="w",
-    force=True
-)
-
-##### SYSTEM PROMPTS ######
+# --- System Prompts ---
 
 CODE_PROMPT = """
 You are an expert Python software engineer specialized in generating code for scientific experiments.
@@ -70,425 +63,231 @@ Instructions:
 5. Respond ONLY with the summary text in Markdown format. Do not include greetings or extraneous explanations.
 """
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    filename=LOG_FILENAME,
+    filemode="w",
+    force=True
+)
+
+
 ##### HELPER FUNCTIONS #####
 
 def get_anthropic_client() -> anthropic.Anthropic:
-    """
-    Initializes Anthropic client using API key
-    """
+    """Initializes and returns the Anthropic client."""
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
+        logging.error("ANTHROPIC_API_KEY environment variable is not set.")
+        raise ValueError("ANTHROPIC_API_KEY environment variable is not set.")
     try:
         client = anthropic.Anthropic(api_key=api_key)
-        logging.info("Anthropic client initialized successfully")
+        logging.info("Anthropic client initialized successfully.")
         return client
     except Exception as e:
         logging.error(f"Failed to initialize Anthropic client: {e}")
         raise
-    
-def extract_python_code(text: str) -> str | None:
-    """
-    Extracts Python code from markdown text
-    """
-    # Look for ```python ... ``` blocks
-    python_block = r"```python\n(.*?)```"
-    matches = re.findall(python_block, text, re.DOTALL)
-    if matches:
-        extracted = matches[0].strip()
-        logging.info("Extracted Python block from LLM response")
-        return extracted
-    logging.error("Failed to find Python block in LLM response")
+
+
+def extract_python_code(text: str) -> Optional[str]:
+    """Extracts Python code enclosed in ```python ... ``` markdown blocks."""
+    match = re.search(r"```python\n(.*?)\n```", text, re.DOTALL)
+    if match:
+        extracted_code = match.group(1).strip()
+        logging.info("Extracted Python code block from LLM response.")
+        return extracted_code
+    logging.error("Failed to find Python code block in LLM response.")
     return None
 
-def run_python_code(code: str, timeout: int, experiment_dir: str) -> tuple[int, str, str]:
-    """
-    Executes given Python code string in a temporary file using a subprocess
-    
-    Args:
-        code: The Python code to execute
-        timout: Maximum execution time in seconds
-        
-    Returns:
-        A tuple (return_code, stdout, stderr):
-        - return_code: The exit code of the subprocess
-        - stdout: The standard output of the script
-        - stderr: The standard error of the script or execution error message
-    """
-    script_name = "main.py"
-    script_path = os.path.join(experiment_dir, script_name)
+
+def _run_subprocess(command: List[str], cwd: str, timeout: int) -> Tuple[int, str, str]:
+    """Helper function to run a subprocess and capture output."""
     stdout, stderr = "", ""
-    
     try:
-        # Write code to script file
-        with open(script_path, "w", encoding="utf-8") as script_file:
-            script_file.write(code)
-            script_file.flush()
-        logging.info(f"Executing generated code in file {script_path}")
-        
-        # Execute using same Python interpreter running this script
         process = subprocess.run(
-            [sys.executable, script_name],
+            command,
             capture_output=True,
             text=True,
             timeout=timeout,
             encoding="utf-8",
             errors="replace",
-            cwd=experiment_dir,
-            check=False # Don't raise exception on non-zero exit
+            cwd=cwd,
+            check=False  # Don't raise exception on non-zero exit
         )
-        
-        stdout = process.stdout
-        stderr = process.stderr
-        return_code = process.returncode
-        
-        logging.info(f"Execution finished with return code: {return_code}")
-        if stdout:
-            logging.info(f"Captured Stdout:\n{stdout}")
-        if stderr:
-            # Log stderr as warning regardless of return code
-            logging.warning(f"Captured Stderr:\n{stderr}")
-
-        return return_code, stdout, stderr
-    
-    # Handle exceptions
+        stdout = process.stdout or ""
+        stderr = process.stderr or ""
+        return process.returncode, stdout, stderr
     except subprocess.TimeoutExpired as e:
-        error_msg = f"Code execution timed out after {timeout} seconds."
+        error_msg = f"Command '{' '.join(command)}' timed out after {timeout} seconds."
         logging.error(error_msg)
-        # Capture any output that was produced before timeout
-        stdout = e.stdout if e.stdout else ""
-        stderr = e.stderr if e.stderr else error_msg
-        if stdout:
-             logging.info(f"Captured Stdout (before timeout):\n{stdout}")
-        logging.error(f"Captured Stderr (before timeout):\n{stderr}")
-        return -1, stdout, stderr
+        stdout = e.stdout or ""
+        stderr = (e.stderr or "") + f"\n{error_msg}"
+        return -1, stdout, stderr # Indicate timeout with -1
     except FileNotFoundError:
-        error_msg = f"File not found error during execution in {experiment_dir}. Interpreter: {sys.executable}"
+        error_msg = f"File not found error during execution in {cwd}. Command: {' '.join(command)}"
         logging.error(error_msg)
-        return -2, "", error_msg
+        return -2, "", error_msg # Indicate file not found with -2
     except Exception as e:
-        error_msg = f"Failed to run subprocess: {e}"
-        logging.exception(error_msg)
-        return -1, "", error_msg
+        error_msg = f"Subprocess failed: {e}"
+        logging.exception(error_msg) # Log exception traceback
+        return -3, "", error_msg # Indicate other exceptions
 
-def install_requirements(requirements: str, timeout: int, experiment_dir: str) -> tuple[int, str, str]:
+
+def run_python_code(code: str, timeout: int, experiment_dir: str) -> Tuple[int, str, str]:
     """
-    Install packages from a requirements string using pip
-    
-    Args: 
-        requirements: string content of requirements.txt file
-        timeout: max time in seconds for pip install command
-    
-    Returns: 
-        A tuple (return_code, stdout, stderr) from the pip process
+    Executes Python code in a specified directory.
+
+    Args:
+        code: The Python code string to execute.
+        timeout: Maximum execution time in seconds.
+        experiment_dir: The directory to execute the code in.
+
+    Returns:
+        Tuple (return_code, stdout, stderr).
+    """
+    script_name = "main.py"
+    script_path = os.path.join(experiment_dir, script_name)
+
+    try:
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        logging.info(f"Python code saved to {script_path}")
+    except IOError as e:
+        error_msg = f"Failed to write Python code to {script_path}: {e}"
+        logging.error(error_msg)
+        return -4, "", error_msg # Indicate file write error
+
+    command = [sys.executable, script_name]
+    logging.info(f"Executing command: {' '.join(command)} in {experiment_dir}")
+    return_code, stdout, stderr = _run_subprocess(command, experiment_dir, timeout)
+
+    logging.info(f"Execution finished. Return code: {return_code}")
+    if stdout:
+        logging.info(f"Captured Stdout:\n{stdout}")
+    if stderr:
+        # Log stderr as warning even on success, as it might contain important info
+        logging.warning(f"Captured Stderr:\n{stderr}")
+
+    return return_code, stdout, stderr
+
+
+def install_requirements(requirements: str, timeout: int, experiment_dir: str) -> Tuple[int, str, str]:
+    """
+    Installs packages from a requirements string using pip.
+
+    Args:
+        requirements: String content of requirements.txt.
+        timeout: Max time in seconds for the pip install command.
+        experiment_dir: The directory containing requirements.txt and where to install.
+
+    Returns:
+        Tuple (return_code, stdout, stderr) from the pip process.
     """
     req_filename = "requirements.txt"
     req_path = os.path.join(experiment_dir, req_filename)
-    stdout, stderr = "", ""
+
     try:
-        # Write requirements to requirements.txt
-        with open(req_path, "w", encoding="utf-8") as req_file:
-            req_file.write(requirements)
-            req_file.flush()
-        logging.info(f"Installing requirements from file {req_path}")
-        
-        # Execute pip install command
-        pip_cmd = [sys.executable, "-m", "pip", "install", "-r", req_filename]
-        logging.info(f"Running pip command: {' '.join(pip_cmd)}")
-        process = subprocess.run(
-            pip_cmd,
-            capture_output=True,
-            text=True,
-            check=False, # Don't raise exception on non-zero exit
-            timeout=timeout,
-            encoding="utf-8",
-            cwd=experiment_dir # Set current working directory
-        )
-        
-        stdout = process.stdout
-        stderr = process.stderr
-        logging.info(f"pip install finished. Return code: {process.returncode}")
-        if process.returncode != 0:
-            logging.error(f"pip install failed for {req_path}")
-            logging.error(f"pip stderr:\n{stderr}")
-            logging.error(f"pip stdout:\n{stdout}")
-        return process.returncode, stdout, stderr
-    
-    except Exception as e:
-        error_msg = f"Failed to install requirements: {e}"
-        logging.exception(error_msg)
-        if not stderr:
-            stderr = error_msg
-        return -1, stdout, stderr
-    
+        with open(req_path, "w", encoding="utf-8") as f:
+            f.write(requirements)
+        logging.info(f"Requirements saved to {req_path}")
+    except IOError as e:
+        error_msg = f"Failed to write requirements to {req_path}: {e}"
+        logging.error(error_msg)
+        return -4, "", error_msg # Indicate file write error
+
+    pip_cmd = [sys.executable, "-m", "pip", "install", "-r", req_filename]
+    logging.info(f"Running pip command: {' '.join(pip_cmd)} in {experiment_dir}")
+    return_code, stdout, stderr = _run_subprocess(pip_cmd, experiment_dir, timeout)
+
+    logging.info(f"pip install finished. Return code: {return_code}")
+    if return_code != 0:
+        logging.error(f"pip install failed for {req_path}")
+        if stderr: logging.error(f"pip stderr:\n{stderr}")
+    else:
+        logging.info("Requirements installed successfully.")
+
+    return return_code, stdout, stderr
+
+##### AGENT #####
+
 class ExperimentAgent:
     """
-    An AI agent that takes an experiment description, generates Python code using
-    Claude, executes it, and iteratively refines the code based on execution errors
-    until success or max retries is reached. 
+    AI agent to generate, execute, refine, and summarize scientific code experiments.
     """
     def __init__(self):
         self.client = get_anthropic_client()
-        self.experiment_dir = None
-    
-    def run_experiment(self, prompt: str) -> tuple[bool, str | None]:
-        """
-        Executes the full code cycle: generating, running, refining, and summarizing.
-        
-        Args:
-            prompt: Text description of experiment
-        
-        Returns:
-            A tuple (success, experiment_dir):
-            - success: True if code executed successfully and summary generated, False otherwise.
-            - experiment_dir: The path to the experiment run directory if successful, None otherwise.
-        """
-        # Ensure the parent agent_runs directory exists
+        self.experiment_dir: Optional[str] = None
+
+    def _setup_experiment_directory(self) -> bool:
+        """Creates a timestamped directory for the current experiment run."""
         try:
             os.makedirs(AGENT_RUN_DIR, exist_ok=True)
-            logging.info(f"Ensured parent directory exists: {AGENT_RUN_DIR}")
         except OSError as e:
-             logging.error(f"Failed to create parent directory {AGENT_RUN_DIR}: {e}")
-             return False, None, f"Failed to create base directory {AGENT_RUN_DIR}: {e}"
-        # Create timestamped directory for this experiment run inside AGENT_RUNS_DIR
-        timestamp = datetime.now().isoformat(timespec='seconds')
-        experiment_folder_name = f"run-{timestamp}"
-        # Store the full path
-        self.experiment_dir = os.path.join(AGENT_RUN_DIR, experiment_folder_name) 
+            logging.error(f"Failed to create base directory {AGENT_RUN_DIR}: {e}")
+            return False
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        experiment_folder_name = f"run_{timestamp}"
+        self.experiment_dir = os.path.join(AGENT_RUN_DIR, experiment_folder_name)
+
         try:
-            os.makedirs(self.experiment_dir, exist_ok=True) 
+            os.makedirs(self.experiment_dir, exist_ok=True)
             logging.info(f"Created experiment directory: {self.experiment_dir}")
+            return True
         except OSError as e:
-             logging.error(f"Failed to create directory {self.experiment_dir}: {e}")
-             return False, None, f"Failed to create directory {self.experiment_dir}: {e}"
-        
-        logging.info(f"Starting experiment")
-        current_code = None
-        last_error_context = None 
-        last_summary = None
-        final_success = False # Track if any iteration succeeded
-        last_stdout = None
-        summary_filename = os.path.join(self.experiment_dir, "summary.txt")
-        
-        for attempt in range(MAX_ITER):
-            logging.info(f"--- Attempt {attempt + 1} of {MAX_ITER} ---")
-            
-            # 1. Generate or refine code
-            # Pass previous summary if last attempt succeeded, otherwise pass error context
-            generated_code = self._generate_code(
-                prompt, 
-                current_code, 
-                last_error_context,
-                last_summary if not last_error_context else None
-                )
-            # Clear previous state for next iteration input
-            last_error_context = None
-            last_summary = None
-            
-            if not generated_code:
-                fail_msg = "Failed to generate or extract code from API"
-                logging.error(fail_msg)
-                # If happens on first attempt, we can't continue
-                if attempt == 0 or not current_code:
-                    return False, None, fail_msg
-                # Otherwise, try to continue with previous code if available
-                logging.warning("Proceeding with code from previous attempt")
-                continue
-            
-            current_code = generated_code
-            logging.info("Generated code for current attempt")
-            
-            # 2. Generate and install requirements
-            requirements = self._generate_requirements(current_code)
-            
-            # Check requirements content before attempting install
-            if requirements is None:
-                # Case 1: generate requirements failed
-                last_error_context = "Failed to generate requirements.txt content"
-                logging.error(last_error_context)
-                continue
-            else:
-                # Case 2: requirements generated
-                logging.info("Attempting to install requirements...")
-                install_ret_code, install_stdout, install_stderr = install_requirements(
-                    requirements, EXEC_TIMEOUT, self.experiment_dir
-                )
-                if install_ret_code == 0:
-                    logging.info("Requirements installed successfully for this attempt")
-                else:
-                    # Failed to install requirements
-                    logging.error("Failed to install generated requirements")
-                    last_error_context = f"""
-                        Failed to install generated requirements:
-                        Pip Stderr:\n{install_stderr}\n
-                        Pip Stdout:\n{install_stdout}\n
-                        Generated requirements.txt:\n{requirements}\n
-                    """
-                    # Continue to next attempt to try to fix
-                    continue
-            
-            # 2.5. Cleanup before execution (only after first attempt)
-            if attempt > 0:
-                logging.info(f"Cleaning up outfiles from previous iteration")
-                # Delete results.txt
-                results_path = os.path.join(self.experiment_dir, "results.txt")
-                try:
-                    if os.path.exists(results_path):
-                        os.remove(results_path)
-                        logging.info(f"Removed previous results file: {results_path}")
-                except OSError as e:
-                    logging.warning(f"Could not remove previous results file {results_path}: {e}")
-                # Delete *.png files
-                png_pattern = os.path.join(self.experiment_dir, "*.png")
-                previous_pngs = glob.glob(png_pattern)
-                if previous_pngs:
-                    logging.info(f"Found {len(previous_pngs)} PNG file(s) from previous attempt to remove.")
-                    for png_file in previous_pngs:
-                        try:
-                            os.remove(png_file)
-                            logging.info(f"Removed previous PNG file: {png_file}")
-                        except OSError as e:
-                            logging.warning(f"Could not remove previous PNG file {png_file}: {e}")
-                else:
-                    logging.info("No previous PNG files found to remove.")
-            
-            # 3. Execute generated code
-            logging.info("Running generated code...")
-            return_code, stdout, stderr = run_python_code(
-                current_code, EXEC_TIMEOUT, self.experiment_dir
-            )
-            last_stdout = stdout
-            
-            # 4. Evaluate execution result
-            if return_code == 0: 
-                # Success
-                logging.info("Code execution successful")
-                final_success = True
-                
-                # 5. Generate summary
-                logging.info("Attempting to generate experiment summary...")
-                summary = self._generate_summary(prompt, current_code)
-                if summary:
-                    last_summary = summary
-                    logging.info(f"--- Generated Experiment Summary ---\n{summary}\n")
-                    summary_filename = os.path.join(self.experiment_dir, "summary.txt")
-                    try:
-                        # Append summary to the file
-                        with open(summary_filename, "a", encoding="utf-8") as f:
-                            f.write(f"--- Summary for Attempt {attempt + 1} ---\n")
-                            f.write(summary)
-                            f.write("\n\n")
-                        logging.info(f"Appended summary to {summary_filename}")
-                    except IOError as e:
-                        logging.error(f"Failed to append summary to file: {e}")
-                        last_error_context = "Failed to generate summary after successful exection"
-                else:
-                    error_msg = "Failed to generate summary after successful exection"
-                    logging.error(error_msg)
-                    last_error_context = error_msg
-            else:
-                # Failure: prepare error context for next generation attempt
-                last_error_context = f"Code execution failed for attempt {attempt+1}\n"
-                logging.warning(last_error_context)
-                if stderr:
-                    last_error_context += f"Stderr:\n{stderr}\n"
-                else:
-                    last_error_context += "No output on stderr\n"
-                if stdout:
-                    last_error_context += f"Stdout:\n{stdout}\n"
-                logging.info("Attempting to refine code based on error...")
-        
-        # Max retries reached
-        logging.info(f"Finished {MAX_ITER} iterations")
-        if final_success:
-            final_msg = f"Agent finished. At least one iteration succeeded."
-            logging.info(final_msg)
-            return True, self.experiment_dir
-        else:
-            final_msg = f"Agent failed after {MAX_ITER} attempts"
-            if last_error_context:
-                final_msg += f"\nLast error:\n{last_error_context}"
-            if last_stdout:
-                final_msg = f"\nLast stdout:\n{last_stdout}"
-            logging.error(final_msg)
-            return False, self.experiment_dir
-        
-    def _generate_code(self, prompt: str, previous_code: str, last_error: str, previous_summary: str | None) -> str | None:
-        """
-        Generates or refines Python code using Claude.
+            logging.error(f"Failed to create experiment directory {self.experiment_dir}: {e}")
+            self.experiment_dir = None # Reset if creation failed
+            return False
 
-        Args:
-            prompt: The original experiment description.
-            previous_code: The code from the previous attempt (if any).
-            last_error: The error context from the previous failed execution (if any).
-            previous_summary: The summary from the previous successful execution (if any).
+    def _cleanup_previous_outputs(self):
+        """Removes results.txt and *.png files from the experiment directory."""
+        if not self.experiment_dir:
+            return
+        logging.info("Cleaning up outputs from previous iteration.")
+        files_to_remove = ["results.txt"] + glob.glob(os.path.join(self.experiment_dir, "*.png"))
+        for file_path in files_to_remove:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    logging.info(f"Removed: {os.path.basename(file_path)}")
+            except OSError as e:
+                logging.warning(f"Could not remove file {file_path}: {e}")
 
-        Returns:
-            The extracted Python code string, or None if API call or extraction fails.
-        """
-        if last_error:
-            # Code refinement request based on error
-            user_content = f"""
-                The following Python code, intended to implement the experiment described below, produced an error.
-                Original Experiment:\n{prompt}\n\n
-                Code Attempt:\n```python\n{previous_code}\n```\n\n
-                Error Context:\n{last_error}\n\n
-                Please refine the Python code to fix the error AND address the original experiment request.
-                Provide the complete, corrected Python code block only, enclosed in ```python ... ```.
-            """
-            logging.info("Generating code to fix the previous error.")
-        elif previous_code and previous_summary:
-            # Code refinement based on previous successful iteration
-            user_content = f"""
-                The previous attempt to implement the experiment below was successful.
-                Original Experiment:\n{prompt}\n\n
-                Previously Successful Code:\n```python\n{previous_code}\n```\n\n
-                Summary of Previous Results:\n{previous_summary}\n\n
-                Please analyze the previous code and summary, then provide an improved version of the Python code.
-                Aim to better address the original experiment request or enhance the previous approach based on its results.
-                Provide the complete, improved Python code block only, enclosed in ```python ... ```.
-            """
-            logging.info("Generating code to improve on the previous successful version.")
-        else:
-            # Initial code generation request
-            user_content = f"""
-                Generate Python code to implement the following experiment:
-                {prompt}
-                Remember to only output the code within a single ```python ... ``` block.
-            """
-            logging.info("Generating initial code.")
-            
-        messages = [{"role": "user", "content": user_content}]
-        
+
+    def _call_anthropic_api(self, system_prompt: str, messages: List[Dict[str, Any]], max_tokens: int, temperature: float) -> Optional[str]:
+        """Handles calling the Anthropic API and basic response/error handling."""
         try:
-            # Call Anthropic API
             response = self.client.messages.create(
                 model=MODEL_NAME,
                 messages=messages,
-                system=CODE_PROMPT,
-                max_tokens=MAX_TOKENS,
-                temperature=TEMPERATURE
+                system=system_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature
             )
-            logging.info("Received response from Anthropic API")
-            
-            # Extract text from response
-            response_text = ""
-            if response.content and isinstance(response.content, list):
-                 # Assume code is in the first block
-                response_text = response.content[0].text
-            else:
-                logging.warning(f"Unexpected response structure: {response}")
-                # Attempt to convert to string as fallback
-                response_text = str(response.content)
-                
-            # Extract Python code from text
-            extracted_code = extract_python_code(response_text)
-            if not extracted_code:
-                logging.error(f"Could not extract Python code from API response:\n{response_text}")
-                return None
-            return extracted_code
+            logging.info(f"Received response from Anthropic API (model: {MODEL_NAME}).")
 
-        # Handle API errors and exceptions
+            # Handle different response content types gracefully
+            if response.content:
+                if isinstance(response.content, list) and response.content:
+                    # Common case: list of blocks, take text from the first one
+                    if hasattr(response.content[0], 'text'):
+                        return response.content[0].text.strip()
+                    else:
+                        logging.warning(f"First content block has no 'text' attribute: {response.content[0]}")
+                        return str(response.content[0]) # Fallback
+                elif isinstance(response.content, list) and not response.content:
+                     # Empty list, e.g., for requirements if none found
+                     logging.info("API returned empty content list.")
+                     return ""
+                else:
+                    # Fallback for unexpected structures
+                    logging.warning(f"Unexpected response content structure: {type(response.content)}")
+                    return str(response.content).strip()
+            else:
+                logging.warning("API response content is empty.")
+                return "" # Return empty string for empty content
+
         except anthropic.APIConnectionError as e:
             logging.error(f"Anthropic API connection error: {e}")
         except anthropic.RateLimitError as e:
@@ -496,168 +295,251 @@ class ExperimentAgent:
         except anthropic.APIStatusError as e:
             logging.error(f"Anthropic API status error: {e.status_code} - {e.response}")
         except Exception as e:
-            logging.exception(f"Anthropic API call failed unexpectedly: {e}")
-        return None
-    
-    def _generate_requirements(self, code: str) -> str | None:
-        """
-        Asks LLM to generate requirements.txt content based on the code provided
-        """
-        user_content = f"""
-            Based only on the import statements in the following Python code, generate a requirements.txt listing the necessary pip packages:
-            \n{code}\n
-            Output ONLY the requirements.txt content, one package per line. 
-        """
+            logging.exception("Anthropic API call failed unexpectedly.") # Log traceback
+        return None # Indicates API call failure
+
+
+    def _generate_code(self, prompt: str, previous_code: Optional[str], last_error: Optional[str], previous_summary: Optional[str]) -> Optional[str]:
+        """Generates or refines Python code using Claude."""
+        user_content = ""
+        log_message = ""
+
+        if last_error:
+            user_content = f"The following Python code, intended to implement the experiment described below, produced an error.\nOriginal Experiment:\n{prompt}\n\nCode Attempt:\n```python\n{previous_code}\n```\n\nError Context:\n{last_error}\n\nPlease refine the Python code to fix the error AND address the original experiment request. Provide the complete, corrected Python code block only, enclosed in ```python ... ```."
+            log_message = "Generating code to fix previous error."
+        elif previous_code and previous_summary:
+            user_content = f"The previous attempt to implement the experiment below was successful.\nOriginal Experiment:\n{prompt}\n\nPreviously Successful Code:\n```python\n{previous_code}\n```\n\nSummary of Previous Results:\n{previous_summary}\n\nPlease analyze the previous code and summary, then provide an improved version of the Python code. Aim to better address the original experiment request or enhance the previous approach based on its results. Provide the complete, improved Python code block only, enclosed in ```python ... ```."
+            log_message = "Generating improved code based on previous success."
+        else:
+            user_content = f"Generate Python code to implement the following experiment:\n{prompt}\nRemember to only output the code within a single ```python ... ``` block."
+            log_message = "Generating initial code."
+
+        logging.info(log_message)
         messages = [{"role": "user", "content": user_content}]
-        try:
-            logging.info("Generating requirements.txt via API")
-            response = self.client.messages.create(
-                model=MODEL_NAME,
-                max_tokens=512,
-                messages=messages,
-                system=REQ_PROMPT,
-                temperature=0.0
-            )
-            response_text = ""
-            if isinstance(response.content, list) and response.content:
-                 # Assume code is in the first block
-                response_text = response.content[0].text
-            elif isinstance(response.content, list) and not response.content:
-                # Content is an empty list [], means no requirements found by LLM
-                logging.info("API returned empty content list, indicating no requirements needed.")
-                response_text = ""
-            else:
-                logging.warning(f"Unexpected response structure: {response}")
-                # Attempt to convert to string as fallback
-                response_text = str(response.content)
-            logging.info("Recieved requirements response from API")
-            return response_text
-        except Exception as e:
-            logging.exception(f"Failed to generate requirements via API: {e}")
-            return None
-        
-    def _generate_summary(self, prompt: str, code: str) -> str | None:
-        """
-        Generates a summary of the experiment using the prompt, code, results.txt, and images
-        """
-        results_content = ""
-        
-        # 1. Read results.txt
+        response_text = self._call_anthropic_api(CODE_PROMPT, messages, MAX_TOKENS, TEMPERATURE)
+
+        if response_text is not None:
+            extracted_code = extract_python_code(response_text)
+            if not extracted_code:
+                logging.error(f"Could not extract Python code from API response:\n{response_text}")
+                return None
+            return extracted_code
+        else:
+            return None # API call failed
+
+
+    def _generate_requirements(self, code: str) -> Optional[str]:
+        """Generates requirements.txt content based on provided code."""
+        user_content = f"Based only on the import statements in the following Python code, generate a requirements.txt listing the necessary pip packages:\n```python\n{code}\n```\nOutput ONLY the requirements.txt content, one package per line."
+        messages = [{"role": "user", "content": user_content}]
+
+        logging.info("Generating requirements.txt via API.")
+        response_text = self._call_anthropic_api(REQ_PROMPT, messages, max_tokens=512, temperature=0.0)
+        # response_text can be None (API failure), "" (no reqs found), or string of reqs
+        return response_text
+
+
+    def _generate_summary(self, prompt: str, code: str) -> Optional[str]:
+        """Generates an experiment summary using prompt, code, results.txt, and images."""
+        if not self.experiment_dir:
+             logging.error("Cannot generate summary: experiment directory not set.")
+             return None
+
+        results_content = "No results.txt file was generated or it was empty."
         results_path = os.path.join(self.experiment_dir, "results.txt")
         try:
             if os.path.exists(results_path):
                 with open(results_path, "r", encoding="utf-8") as f:
-                    results_content = f.read()
+                    results_content = f.read().strip()
+                    if not results_content:
+                        results_content = "results.txt exists but is empty."
                 logging.info(f"Read {len(results_content)} bytes from {results_path}")
             else:
-                logging.error(f"{results_path} not found")
+                logging.info(f"{results_path} not found for summary.")
         except Exception as e:
             logging.error(f"Error reading {results_path}: {e}")
-            
-        # 2. Construct initial part of API message
-        user_message_content = [
-            {
-                "type": "text",
-                "text": f"""Please synthesize all information below (text, code, images) and summarize the following experiment.
-Original Request:
-{prompt}
+            results_content = f"Error reading results.txt: {e}"
 
-Executed Code:
-```python
-{code}
-```
-
-Textual Results (from results.txt):
-{results_content if results_content else "No results.txt file was generated or it was empty."}
-
-Generated Images (if any) follow:
-                """
-            }
+        # Construct initial message parts
+        user_message_content: List[Dict[str, Any]] = [
+            {"type": "text", "text": f"Please synthesize all information below (text, code, images) and summarize the following experiment.\nOriginal Request:\n{prompt}\n\nExecuted Code:\n```python\n{code}\n```\n\nTextual Results (from results.txt):\n{results_content}\n\nGenerated Images (if any) follow:"}
         ]
-        
-        # 3. Find, prepare, and append PNG images
-        png_pattern = "*.png"
-        png_files = glob.glob(os.path.join(self.experiment_dir, png_pattern))
-        logging.info(f"Found {len(png_files)} PNG files for summary")
-        
+
+        # Find, encode, and append PNG images
+        png_files = glob.glob(os.path.join(self.experiment_dir, "*.png"))
+        logging.info(f"Found {len(png_files)} PNG files for summary in {self.experiment_dir}.")
         for i, img_path in enumerate(png_files):
             try:
                 with open(img_path, "rb") as image_file:
-                    image_bytes = image_file.read()
-                base64_image = base64.b64encode(image_bytes).decode("utf-8")
-                media_type = "image/png"
-                # Add text block describing image
-                user_message_content.append({
-                    "type": "text",
-                    "text": f"Image {i+1}: {os.path.basename(img_path)}"
-                })
-                # Add the image block
+                    image_data = base64.b64encode(image_file.read()).decode("utf-8")
+                user_message_content.append({"type": "text", "text": f"Image {i+1}: {os.path.basename(img_path)}"})
                 user_message_content.append({
                     "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": base64_image
-                    }
+                    "source": {"type": "base64", "media_type": "image/png", "data": image_data}
                 })
-                logging.info(f"Prepared image {os.path.basename(img_path)} for summary")
+                logging.info(f"Added image {os.path.basename(img_path)} to summary request.")
             except Exception as e:
-                logging.error(f"Error processing image {os.path.basename(img_path)}: {e}")
-        
-        messages = [{"role": "user", "content": user_message_content}]
-        
-        # 4. Call API
-        try:
-            logging.info("Calling Anthropic API to generate summary")
-            response = self.client.messages.create(
-                model=MODEL_NAME, # Ensure this model supports vision
-                max_tokens=MAX_TOKENS, 
-                messages=messages,
-                system=SUMMARY_PROMPT,
-                temperature=TEMPERATURE 
-            )
-            summary = ""
-            if response.content and isinstance(response.content, list):
-                 # Assume summary is in first block
-                summary = response.content[0].text
-            else:
-                logging.warning(f"Unexpected response structure: {response}")
-                # Attempt to convert to string as fallback
-                summary = str(response.content)
-            logging.info("Successfully generated experiment summary")
-            return summary.strip()
+                logging.error(f"Error processing image {img_path} for summary: {e}")
+                user_message_content.append({"type": "text", "text": f"Error processing image {os.path.basename(img_path)}: {e}"})
 
-        except Exception as e:
-            logging.exception(f"Summary API call failed: {e}")
-        return None
-            
+
+        messages = [{"role": "user", "content": user_message_content}]
+        logging.info("Calling Anthropic API to generate summary.")
+        summary = self._call_anthropic_api(SUMMARY_PROMPT, messages, MAX_TOKENS, TEMPERATURE)
+
+        if summary is not None:
+            logging.info("Successfully generated experiment summary.")
+            return summary # Already stripped in _call_anthropic_api
+        else:
+            logging.error("Summary generation failed (API call error).")
+            return None
+
+
+    def run_experiment(self, prompt: str) -> Tuple[bool, Optional[str]]:
+        """
+        Runs the full experiment cycle: setup, generate, install, execute, refine, summarize.
+
+        Args:
+            prompt: Text description of the experiment.
+
+        Returns:
+            A tuple (success, experiment_dir):
+            - success: True if any iteration executed successfully and generated a summary.
+            - experiment_dir: Path to the run directory, or None if setup failed.
+        """
+        if not self._setup_experiment_directory() or not self.experiment_dir:
+            return False, None
+
+        logging.info(f"--- Starting Experiment Run in {self.experiment_dir} ---")
+        logging.info(f"Original Prompt: {prompt}")
+
+        current_code: Optional[str] = None
+        last_error_context: Optional[str] = None
+        last_summary: Optional[str] = None
+        final_success = False
+        summary_filename = os.path.join(self.experiment_dir, "summary.md") # Use markdown extension
+
+        for attempt in range(MAX_ITER):
+            logging.info(f"--- Attempt {attempt + 1} of {MAX_ITER} ---")
+
+            # 1. Generate or Refine Code
+            # Use previous summary only if last iteration succeeded (no error context)
+            generated_code = self._generate_code(prompt, current_code, last_error_context, last_summary if not last_error_context else None)
+            # Reset context for the next loop iteration
+            last_error_context = None
+            last_summary = None
+
+            if not generated_code:
+                log_msg = "Failed to generate or extract code."
+                logging.error(log_msg)
+                if attempt == 0: return False, self.experiment_dir # Cannot continue without initial code
+                logging.warning("Continuing iteration with previous code (if available).")
+                if not current_code: return False, self.experiment_dir # Should not happen if attempt > 0, but safety check
+                # Keep using current_code
+            else:
+                current_code = generated_code # Update code for this attempt
+
+            # 2. Generate and Install Requirements
+            requirements = self._generate_requirements(current_code)
+            if requirements is None:
+                last_error_context = "Failed to generate requirements via API."
+                logging.error(last_error_context)
+                continue # Try next iteration to potentially fix code/reqs generation
+            elif requirements: # Only install if requirements are not empty
+                logging.info(f"Attempting to install requirements:\n{requirements}")
+                install_ret_code, install_stdout, install_stderr = install_requirements(
+                    requirements, EXEC_TIMEOUT * 2, self.experiment_dir # Allow more time for pip
+                )
+                if install_ret_code != 0:
+                    logging.error("Failed to install generated requirements.")
+                    last_error_context = f"Failed to install requirements.\nPip Stderr:\n{install_stderr}\nPip Stdout:\n{install_stdout}\nRequirements:\n{requirements}"
+                    continue # Try next iteration
+                logging.info("Requirements installed successfully.")
+            else:
+                logging.info("No external requirements identified or needed.")
+
+            # 3. Cleanup previous outputs (if not first attempt)
+            if attempt > 0:
+                self._cleanup_previous_outputs()
+
+            # 4. Execute Code
+            logging.info("Executing generated code...")
+            return_code, stdout, stderr = run_python_code(
+                current_code, EXEC_TIMEOUT, self.experiment_dir
+            )
+
+            # 5. Evaluate Execution & Summarize on Success
+            if return_code == 0:
+                logging.info("Code execution successful.")
+                final_success = True # Mark that at least one attempt succeeded
+                summary = self._generate_summary(prompt, current_code)
+                if summary:
+                    last_summary = summary # Store for potential refinement in the next iter
+                    logging.info(f"--- Generated Experiment Summary (Attempt {attempt + 1}) ---\n{summary}\n--- End Summary ---")
+                    try:
+                        # Append summary to the file
+                        with open(summary_filename, "a", encoding="utf-8") as f:
+                            f.write(f"# Summary for Attempt {attempt + 1}\n\n")
+                            f.write(summary)
+                            f.write("\n\n---\n\n")
+                        logging.info(f"Appended summary to {summary_filename}")
+                    except IOError as e:
+                        logging.error(f"Failed to write summary to file: {e}")
+                        # Continue, but log the failure
+                else:
+                    # Summary generation failed after successful execution
+                    logging.error("Failed to generate summary after successful execution.")
+                    last_error_context = "Execution succeeded, but failed to generate summary."
+                    # Consider if we should continue or break here. Let's continue for now.
+            else:
+                # Execution Failed
+                logging.warning(f"Code execution failed (return code: {return_code}).")
+                last_error_context = f"Code execution failed.\nReturn Code: {return_code}\nStderr:\n{stderr}\nStdout:\n{stdout}"
+                logging.info("Attempting to refine code based on error...")
+                # Error context is set, loop will continue to _generate_code
+
+
+        # End of loop
+        logging.info(f"--- Finished {MAX_ITER} Iterations ---")
+        if final_success:
+            return True, self.experiment_dir
+        else:
+            if last_error_context: # Include context from the very last failed attempt
+                final_msg += f"\nLast error context:\n{last_error_context}"
+            logging.error(final_msg)
+            return False, self.experiment_dir
+
 
 if __name__ == "__main__":
-    # Get prompt
-    prompt = "Generate a non-linear data and train a neural network on it as best as you can."
-    # prompt = "Generate and test an algorithm that efficiently checks if a number is prime"
-    
-    # Log the start and the log file being used
-    print(f"--- Experiment Agent Started ---")
-    logging.info(f"Using model: {MODEL_NAME}, Max Iterations: {MAX_ITER}, Timeout: {EXEC_TIMEOUT}s")
-    
+    # Example Usage
+    initial_prompt = "Create a classification task with non-linear data and train a neural network on it as best you can."
+
+    print("--- Experiment Agent Started ---")
+    print(f"Logging to: {LOG_FILENAME}")
+    logging.info(f"Starting agent run with model: {MODEL_NAME}, Max Iter: {MAX_ITER}, Timeout: {EXEC_TIMEOUT}s")
+    logging.info(f"Initial Prompt: {initial_prompt}")
+
+    agent = ExperimentAgent()
     try:
-        # Run agent
-        agent = ExperimentAgent()
-        success, run_dir = agent.run_experiment(prompt)
-        
-        # Final status message
-        if success and run_dir:
-            final_msg = f"Agent run completed. Check {run_dir} for details"
-            logging.info(final_msg)
+        success, run_directory = agent.run_experiment(initial_prompt)
+
+        if success and run_directory:
+            final_message = f"Agent run completed successfully. Check results in: {run_directory}"
+            print(final_message)
+            logging.info(final_message)
         else:
-            final_msg = f"Agent run failed. Check {LOG_FILENAME} for action history."
-            logging.error(final_msg)
-        print(final_msg)
-            
+            final_message = f"Agent run failed or did not succeed within {MAX_ITER} attempts."
+            if run_directory:
+                final_message += f" Check logs and artifacts in: {run_directory}"
+            else:
+                final_message += f" Check {LOG_FILENAME} for setup errors."
+            print(final_message)
+            logging.error(final_message)
+
     except Exception as e:
-        logging.error(f"Critical error during agent run: {e}")
-        
+        logging.exception("Critical error during agent execution.") # Log traceback
+        print(f"A critical error occurred. Check {LOG_FILENAME} for details.")
+
     finally:
-        print(f"--- Experiment Agent Finished ---")
+        print("--- Experiment Agent Finished ---")
     

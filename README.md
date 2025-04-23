@@ -25,13 +25,13 @@ This project contains a Python-based AI agent (`agent.py`) designed to automate 
     export ANTHROPIC_API_KEY='your_api_key_here'
     ```
 2.  **Constants**: Key operational parameters are defined as constants at the top of `agent.py`:
-    *   `MAX_ITER`: Maximum refinement attempts for code execution (default: 2).
-    *   `EXEC_TIMEOUT`: Maximum execution time for the generated Python script in seconds (default: 20).
-    *   `AGENT_RUN_DIR`: Parent directory for storing experiment runs (default: "runs").
-    *   `LOG_FILENAME`: Name of the log file (default: "agent.log").
-    *   `MODEL_NAME`: Anthropic model used (default: "claude-3-5-sonnet-20240620").
-    *   `MAX_TOKENS`: Maximum tokens for API responses (default: 2048).
-    *   `TEMPERATURE`: Sampling temperature for API responses (default: 0.2).
+    *   `MAX_ITER`: Maximum refinement attempts for code execution.
+    *   `EXEC_TIMEOUT`: Maximum execution time for the generated Python script in seconds.
+    *   `AGENT_RUN_DIR`: Parent directory for storing experiment runs.
+    *   `LOG_FILENAME`: Name of the log file.
+    *   `MODEL_NAME`: Anthropic model used.
+    *   `MAX_TOKENS`: Maximum tokens for API responses.
+    *   `TEMPERATURE`: Sampling temperature for API responses.
 
 ## Dependencies
 

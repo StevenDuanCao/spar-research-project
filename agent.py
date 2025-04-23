@@ -13,17 +13,17 @@ from typing import Tuple, Optional, List, Dict, Any
 ##### CONFIGURATION #####
 
 # Agent constants
-MAX_ITER = 2
-EXEC_TIMEOUT = 20  # execution limit in seconds
-AGENT_RUN_DIR = "runs"  # Parent directory for experiment runs
+MAX_ITER = 2                # Number of agent iterations
+EXEC_TIMEOUT = 20           # Execution limit in seconds
+AGENT_RUN_DIR = "runs"      # Parent directory for experiment runs
 LOG_FILENAME = "agent.log"  # Log file for agent actions
 
-# Anthropic API constants
-MODEL_NAME = "claude-3-5-sonnet-20240620"
+# Model API constants
+MODEL_NAME = "claude-3-5-sonnet-20240620"   # Must possess vision capabilities
 MAX_TOKENS = 2048
 TEMPERATURE = 0.2
 
-# --- System Prompts ---
+# System prompts
 
 CODE_PROMPT = """
 You are an expert Python software engineer specialized in generating code for scientific experiments.
@@ -208,6 +208,7 @@ def install_requirements(requirements: str, timeout: int, experiment_dir: str) -
         logging.info("Requirements installed successfully.")
 
     return return_code, stdout, stderr
+
 
 ##### AGENT #####
 
